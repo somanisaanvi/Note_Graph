@@ -4,7 +4,6 @@ import {
   BookOpen, 
   Edit3, 
   Network, 
-  ArrowLeftRight, 
   Search, 
   Trash2, 
   Folder, 
@@ -19,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { marked } from 'marked';
+import InteractiveGraph from './components/InteractiveGraph';
 import { 
   db, 
   createNote, 
@@ -253,43 +253,6 @@ export default function App() {
       }
     }, 450);
   };
-
-  // Real-time Dexie.js live query connecting to local 'links' table for backlinks
-  const backlinks = useLiveQuery(
-    async () => {
-      if (!activeNoteId || !currentTitle) return [];
-
-      const normalizedTitle = currentTitle.trim().toLowerCase();
-
-      // Find all incoming links in db.links pointing to this note (by ID or targetTitle)
-      const incomingLinks = await db.links
-        .filter(
-          (link) =>
-            link.sourceNoteId !== activeNoteId &&
-            ((link.targetNoteId && link.targetNoteId === activeNoteId) ||
-              (link.targetTitle && link.targetTitle.trim().toLowerCase() === normalizedTitle))
-        )
-        .toArray();
-
-      if (incomingLinks.length === 0) return [];
-
-      // Fetch the source notes for these links
-      const sourceIds = [...new Set(incomingLinks.map((l) => l.sourceNoteId))];
-      const sourceNotes = await db.notes.where('id').anyOf(sourceIds).toArray();
-
-      return sourceNotes.map((sourceNote) => {
-        const link = incomingLinks.find((l) => l.sourceNoteId === sourceNote.id);
-        return {
-          id: sourceNote.id,
-          title: sourceNote.title,
-          content: sourceNote.content,
-          targetTitle: link?.targetTitle || currentTitle,
-        };
-      });
-    },
-    [activeNoteId, currentTitle],
-    []
-  );
 
   // Switch active note with flush protection
   const handleSelectNote = async (noteId) => {
@@ -813,12 +776,7 @@ export default function App() {
                       </span>
                     )}
                   </div>
-                ) : (
-                  <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-slate-500">
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-600"></span>
-                    <span>IndexedDB Mode</span>
-                  </div>
-                )}
+                ) : null}
 
                 {/* Mode Switcher Buttons */}
                 <div className="flex items-center bg-slate-900 p-1 rounded-lg border border-slate-800">
@@ -891,71 +849,13 @@ export default function App() {
         )}
       </main>
 
-      {/* ------------------- RIGHT COLUMN: GRAPH & BACKLINKS ------------------- */}
-      <aside className="w-80 flex flex-col bg-slate-900/30">
-        {/* Graph Preview Section */}
-        <div className="h-1/2 border-b border-slate-800 p-4 flex flex-col">
-          <div className="flex items-center justify-between text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
-            <div className="flex items-center gap-2">
-              <Network className="w-4 h-4 text-indigo-400" /> Interactive Graph
-            </div>
-            {vaultHandle && (
-              <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                Disk Synced
-              </span>
-            )}
-          </div>
-          <div className="flex-1 bg-slate-950 rounded-xl border border-slate-800/80 flex flex-col items-center justify-center text-slate-600 text-xs p-4 text-center">
-            <Network className="w-8 h-8 text-indigo-400/40 mb-2" />
-            <span className="text-slate-300 font-medium">
-              {vaultHandle ? 'Local Disk Notes Mapped' : 'Dexie.js Links Synced'}
-            </span>
-            <span className="text-[11px] text-slate-500 mt-1">
-              {notes?.length || 0} notes • {totalLinksCount || 0} active links
-            </span>
-          </div>
-        </div>
-
-        {/* Backlinks Panel */}
-        <div className="h-1/2 p-4 flex flex-col">
-          <div className="flex items-center justify-between text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
-            <div className="flex items-center gap-2">
-              <ArrowLeftRight className="w-4 h-4 text-indigo-400" /> Backlinks
-            </div>
-            {backlinks && backlinks.length > 0 && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 font-mono">
-                {backlinks.length}
-              </span>
-            )}
-          </div>
-
-          <div className="flex-1 overflow-y-auto space-y-2">
-            {backlinks && backlinks.length > 0 ? (
-              backlinks.map((linkNote) => (
-                <button
-                  key={linkNote.id}
-                  onClick={() => handleSelectNote(linkNote.id)}
-                  className="w-full text-left p-2.5 rounded-lg bg-slate-900/80 hover:bg-slate-800 border border-slate-800 hover:border-indigo-500/30 text-xs text-slate-300 transition cursor-pointer group"
-                >
-                  <div className="font-medium text-indigo-400 group-hover:text-indigo-300 flex items-center justify-between">
-                    <span className="truncate">{linkNote.title}</span>
-                    <span className="text-[10px] text-slate-500 uppercase tracking-wide shrink-0 ml-1">Ref</span>
-                  </div>
-                  <div className="text-slate-500 line-clamp-2 mt-1 text-[11px] font-mono leading-relaxed">
-                    {linkNote.content}
-                  </div>
-                </button>
-              ))
-            ) : (
-              <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800 text-xs text-slate-500 italic">
-                {activeNote || activeNoteId
-                  ? `No notes currently link to [[${currentTitle}]].`
-                  : 'Select a note to view backlinks.'}
-              </div>
-            )}
-          </div>
-        </div>
+      {/* ------------------- RIGHT COLUMN: INTERACTIVE GRAPH ------------------- */}
+      <aside className="w-80 lg:w-96 shrink-0 flex flex-col border-l border-slate-800 bg-slate-900/30">
+        <InteractiveGraph
+          activeNoteId={activeNoteId}
+          onSelectNote={handleSelectNote}
+          vaultHandle={vaultHandle}
+        />
       </aside>
 
       {/* Vault Management Dialog Modal */}

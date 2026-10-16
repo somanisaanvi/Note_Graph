@@ -158,23 +158,105 @@ export async function syncAllNoteLinks() {
 
 // ------------------- NLP SEMANTIC EMBEDDINGS & SIMILARITY -------------------
 
+// ------------------- NLP SEMANTIC EMBEDDINGS & SIMILARITY -------------------
+
 // 1. Initialize the feature extraction pipeline (loads once)
 let extractor = null;
 let extractorPromise = null;
 
+// In-memory cache for computed note embeddings: noteId -> { hash: number, data: Array<number> }
+const embeddingsCache = new Map();
+
+// Reactive NLP status tracking
+let nlpStatus = { state: 'idle', message: 'NLP Ready', lastUpdated: Date.now() };
+const nlpListeners = new Set();
+
+export function getNlpStatus() {
+  return nlpStatus;
+}
+
+export function subscribeNlpStatus(listener) {
+  nlpListeners.add(listener);
+  listener(nlpStatus);
+  return () => nlpListeners.delete(listener);
+}
+
+function setNlpStatus(state, message = '') {
+  nlpStatus = { state, message, lastUpdated: Date.now() };
+  nlpListeners.forEach((fn) => {
+    try {
+      fn(nlpStatus);
+    } catch (e) {
+      console.warn('NLP status listener error:', e);
+    }
+  });
+}
+
+/**
+ * Lightweight string hash to detect whether note content has actually changed
+ */
+function hashText(text) {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  return hash;
+}
+
+/**
+ * Offline/fallback cosine similarity using term frequencies if model download is unavailable
+ */
+function fallbackCosineSimilarity(textA, textB) {
+  const tokenize = (str) =>
+    (str || '')
+      .toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+
+  const wordsA = tokenize(textA);
+  const wordsB = tokenize(textB);
+  if (wordsA.length === 0 || wordsB.length === 0) return 0;
+
+  const freqA = {};
+  const freqB = {};
+  wordsA.forEach((w) => (freqA[w] = (freqA[w] || 0) + 1));
+  wordsB.forEach((w) => (freqB[w] = (freqB[w] || 0) + 1));
+
+  const allWords = Array.from(new Set([...wordsA, ...wordsB]));
+  let dotProduct = 0;
+  let mA = 0;
+  let mB = 0;
+
+  for (const w of allWords) {
+    const a = freqA[w] || 0;
+    const b = freqB[w] || 0;
+    dotProduct += a * b;
+    mA += a * a;
+    mB += b * b;
+  }
+
+  const mag = Math.sqrt(mA) * Math.sqrt(mB);
+  return mag === 0 ? 0 : dotProduct / mag;
+}
+
 export async function getExtractor() {
   if (!extractor) {
     if (!extractorPromise) {
+      setNlpStatus('loading', 'Loading all-MiniLM-L6-v2 neural model...');
       extractorPromise = pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
         quantized: true
       })
         .then((pipe) => {
           extractor = pipe;
+          setNlpStatus('idle', 'NLP Model Ready');
           return pipe;
         })
         .catch((err) => {
           extractorPromise = null;
-          console.error('[NLP] Failed to load feature extraction model:', err);
+          setNlpStatus('fallback', 'Using fast keyword similarity fallback');
+          console.warn('[NLP] Neural model unavailable, using keyword fallback:', err);
           throw err;
         });
     }
@@ -204,19 +286,38 @@ function getNoteText(note) {
  * @param {number} threshold - Cosine similarity threshold (default 0.40)
  * @returns {Promise<Array<Object>>} Notes appended with their semantic links
  */
-export async function linkSimilarNotes(notes, threshold = 0.60) {
+export async function linkSimilarNotes(notes, threshold = 0.40) {
   if (!notes || notes.length === 0) return [];
 
-  console.log(`[NLP] Generating embeddings for ${notes.length} notes...`);
-  const pipe = await getExtractor();
+  let pipe = null;
+  try {
+    pipe = await getExtractor();
+  } catch (err) {
+    console.warn('[NLP] Falling back to text similarity:', err.message);
+  }
 
-  // Generate embeddings for all notes
+  // Generate or retrieve cached embeddings for all notes
   const embeddings = [];
   for (const note of notes) {
     const text = getNoteText(note) || 'Untitled Note';
-    // 'mean_pooling' and 'normalize' give ready-to-use semantic vectors
-    const output = await pipe(text, { pooling: 'mean', normalize: true });
-    embeddings.push(output.data);
+    const textHash = hashText(text);
+    const cached = embeddingsCache.get(note.id);
+
+    if (cached && cached.hash === textHash && cached.data) {
+      embeddings.push(cached.data);
+    } else if (pipe) {
+      try {
+        const output = await pipe(text, { pooling: 'mean', normalize: true });
+        const vector = Array.from(output.data);
+        embeddingsCache.set(note.id, { hash: textHash, data: vector });
+        embeddings.push(vector);
+      } catch (e) {
+        console.warn('[NLP] Embedding extraction failed for note:', note.id, e);
+        embeddings.push(null);
+      }
+    } else {
+      embeddings.push(null);
+    }
   }
 
   // Compare every note with every other note
@@ -226,14 +327,14 @@ export async function linkSimilarNotes(notes, threshold = 0.60) {
     for (let j = 0; j < notes.length; j++) {
       if (i === j) continue; // Skip comparing a note to itself
 
-      // Calculate cosine similarity between the two vector arrays
-      const score = cosine_similarity(embeddings[i], embeddings[j]);
+      let score = 0;
+      if (embeddings[i] && embeddings[j]) {
+        score = cosine_similarity(embeddings[i], embeddings[j]);
+      } else {
+        score = fallbackCosineSimilarity(getNoteText(note), getNoteText(notes[j]));
+      }
 
-      const titleI = note.title || `Note ${note.id}`;
-      const titleJ = notes[j].title || `Note ${notes[j].id}`;
-      console.log(`[NLP] "${titleI}" <-> "${titleJ}" => score: ${score.toFixed(3)} (threshold: ${threshold}) ${score >= threshold ? '✅ LINKED' : '❌'}`);
-
-      // Link them if they pass your semantic threshold
+      // Link them if they pass threshold
       if (score >= threshold) {
         relatedLinks.push({
           id: notes[j].id,
@@ -247,7 +348,6 @@ export async function linkSimilarNotes(notes, threshold = 0.60) {
     // Sort related links by highest similarity first
     relatedLinks.sort((a, b) => b.score - a.score);
 
-    // Return the original note appended with its local links
     return {
       ...note,
       links: relatedLinks
@@ -258,60 +358,118 @@ export async function linkSimilarNotes(notes, threshold = 0.60) {
 }
 
 /**
- * Computes semantic links across all notes in IndexedDB and stores them in:
- * 1. The note records in `db.notes` (updating each note with a `links` array)
- * 2. The `semanticLinks` table in IndexedDB for relational querying
- * @param {number} threshold - Semantic similarity threshold (default 0.40)
+ * Computes semantic similarity across all notes in IndexedDB and stores them in:
+ * 1. The note records in `db.notes` (updating each note with a sorted `links` array)
+ * 2. The `semanticLinks` table in IndexedDB with exact pairwise similarity scores
+ * @param {number} threshold - Min score filter for db.notes.links (default 0.30)
  * @returns {Promise<Array>} Array of updated notes with links
  */
-export async function syncSemanticLinks(threshold = 0.40) {
+export async function syncSemanticLinks(threshold = 0.30) {
   try {
+    setNlpStatus('computing', 'Analyzing semantic connections...');
     const allNotes = await db.notes.toArray();
     if (!allNotes || allNotes.length < 2) {
       if (allNotes && allNotes.length === 1) {
         await db.notes.update(allNotes[0].id, { links: [] });
-        await db.semanticLinks.clear();
       }
-      return allNotes;
+      await db.semanticLinks.clear();
+      setNlpStatus('idle', 'NLP Ready');
+      return allNotes || [];
     }
 
-    const linkedNotes = await linkSimilarNotes(allNotes, threshold);
+    let pipe = null;
+    try {
+      pipe = await getExtractor();
+    } catch (err) {
+      console.warn('[NLP] Neural pipe failed, using fallback:', err.message);
+    }
+
+    // Compute or load cached embeddings
+    const embeddings = [];
+    for (const note of allNotes) {
+      const text = getNoteText(note) || 'Untitled Note';
+      const textHash = hashText(text);
+      const cached = embeddingsCache.get(note.id);
+
+      if (cached && cached.hash === textHash && cached.data) {
+        embeddings.push(cached.data);
+      } else if (pipe) {
+        try {
+          const output = await pipe(text, { pooling: 'mean', normalize: true });
+          const vector = Array.from(output.data);
+          embeddingsCache.set(note.id, { hash: textHash, data: vector });
+          embeddings.push(vector);
+        } catch (e) {
+          console.warn('[NLP] Error creating embedding:', e);
+          embeddings.push(null);
+        }
+      } else {
+        embeddings.push(null);
+      }
+    }
+
+    // Compute all pairwise scores between every unique pair (i < j)
+    const pairwiseRecords = [];
+    const noteLinksMap = new Map();
+    allNotes.forEach((n) => noteLinksMap.set(n.id, []));
+
+    for (let i = 0; i < allNotes.length; i++) {
+      for (let j = i + 1; j < allNotes.length; j++) {
+        let score = 0;
+        if (embeddings[i] && embeddings[j]) {
+          score = cosine_similarity(embeddings[i], embeddings[j]);
+        } else {
+          score = fallbackCosineSimilarity(getNoteText(allNotes[i]), getNoteText(allNotes[j]));
+        }
+
+        const normalizedScore = Number(Math.max(0, Math.min(1, score)).toFixed(2));
+
+        pairwiseRecords.push({
+          sourceNoteId: allNotes[i].id,
+          targetNoteId: allNotes[j].id,
+          sourceTitle: allNotes[i].title || 'Untitled Note',
+          targetTitle: allNotes[j].title || 'Untitled Note',
+          score: normalizedScore,
+          createdAt: new Date().toISOString()
+        });
+
+        // Add to both notes' local links for fast note-centric lookup
+        noteLinksMap.get(allNotes[i].id).push({
+          id: allNotes[j].id,
+          title: allNotes[j].title || '',
+          score: normalizedScore
+        });
+        noteLinksMap.get(allNotes[j].id).push({
+          id: allNotes[i].id,
+          title: allNotes[i].title || '',
+          score: normalizedScore
+        });
+      }
+    }
 
     // Persist into IndexedDB
     await db.transaction('rw', db.notes, db.semanticLinks, async () => {
-      // 1. Update notes table with links array on each note
-      for (const note of linkedNotes) {
-        await db.notes.update(note.id, {
-          links: note.links
-        });
+      // 1. Update notes table with sorted links
+      for (const note of allNotes) {
+        const sortedLinks = (noteLinksMap.get(note.id) || [])
+          .filter((l) => l.score >= threshold)
+          .sort((a, b) => b.score - a.score);
+        await db.notes.update(note.id, { links: sortedLinks });
       }
 
-      // 2. Refresh semanticLinks table
+      // 2. Replace semanticLinks table with all computed pairs
       await db.semanticLinks.clear();
-      const semanticRecords = [];
-      for (const note of linkedNotes) {
-        if (note.links && note.links.length > 0) {
-          for (const link of note.links) {
-            semanticRecords.push({
-              sourceNoteId: note.id,
-              targetNoteId: link.id,
-              targetTitle: link.title || '',
-              score: link.score,
-              createdAt: new Date().toISOString()
-            });
-          }
-        }
+      if (pairwiseRecords.length > 0) {
+        await db.semanticLinks.bulkAdd(pairwiseRecords);
       }
-
-      if (semanticRecords.length > 0) {
-        await db.semanticLinks.bulkAdd(semanticRecords);
-      }
-      console.log(`[NLP] Successfully stored ${semanticRecords.length} semantic link records in IndexedDB.`);
     });
 
-    return linkedNotes;
+    setNlpStatus('idle', `NLP Connected (${pairwiseRecords.length} pairs calculated)`);
+    console.log(`[NLP] Successfully computed ${pairwiseRecords.length} pairwise semantic links.`);
+    return allNotes;
   } catch (err) {
     console.error('[NLP] Error syncing semantic links:', err);
+    setNlpStatus('error', err.message || 'NLP sync error');
     return [];
   }
 }
@@ -321,9 +479,9 @@ let syncTimeout = null;
 
 /**
  * Schedule background semantic link calculation after an editing pause
- * @param {number} delayMs - Debounce delay in ms (default 3000ms)
+ * @param {number} delayMs - Debounce delay in ms (default 2000ms)
  */
-export function scheduleSemanticSync(delayMs = 3000) {
+export function scheduleSemanticSync(delayMs = 2000) {
   if (syncTimeout) {
     clearTimeout(syncTimeout);
   }
@@ -350,6 +508,12 @@ export async function ensureInitialNotes() {
   const linksCount = await db.links.count();
   if (linksCount === 0) {
     await syncAllNoteLinks();
+  }
+
+  // Ensure semantic links are computed for existing notes
+  const semanticCount = await db.semanticLinks.count();
+  if (semanticCount === 0) {
+    syncSemanticLinks().catch(console.warn);
   }
 }
 
