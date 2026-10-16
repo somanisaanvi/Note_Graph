@@ -185,12 +185,13 @@ function getNoteText(note) {
 /**
  * 2. Find and link related notes using NLP semantic vector similarity
  * @param {Array<Object>} notes - Array of note/todo objects
- * @param {number} threshold - Cosine similarity threshold (default 0.65)
+ * @param {number} threshold - Cosine similarity threshold (default 0.40)
  * @returns {Promise<Array<Object>>} Notes appended with their semantic links
  */
-export async function linkSimilarNotes(notes, threshold = 0.65) {
+export async function linkSimilarNotes(notes, threshold = 0.60) {
   if (!notes || notes.length === 0) return [];
 
+  console.log(`[NLP] Generating embeddings for ${notes.length} notes...`);
   const pipe = await getExtractor();
 
   // Generate embeddings for all notes
@@ -211,6 +212,10 @@ export async function linkSimilarNotes(notes, threshold = 0.65) {
 
       // Calculate cosine similarity between the two vector arrays
       const score = cosine_similarity(embeddings[i], embeddings[j]);
+
+      const titleI = note.title || `Note ${note.id}`;
+      const titleJ = notes[j].title || `Note ${notes[j].id}`;
+      console.log(`[NLP] "${titleI}" <-> "${titleJ}" => score: ${score.toFixed(3)} (threshold: ${threshold}) ${score >= threshold ? '✅ LINKED' : '❌'}`);
 
       // Link them if they pass your semantic threshold
       if (score >= threshold) {
@@ -240,10 +245,10 @@ export async function linkSimilarNotes(notes, threshold = 0.65) {
  * Computes semantic links across all notes in IndexedDB and stores them in:
  * 1. The note records in `db.notes` (updating each note with a `links` array)
  * 2. The `semanticLinks` table in IndexedDB for relational querying
- * @param {number} threshold - Semantic similarity threshold (default 0.65)
+ * @param {number} threshold - Semantic similarity threshold (default 0.40)
  * @returns {Promise<Array>} Array of updated notes with links
  */
-export async function syncSemanticLinks(threshold = 0.65) {
+export async function syncSemanticLinks(threshold = 0.40) {
   try {
     const allNotes = await db.notes.toArray();
     if (!allNotes || allNotes.length < 2) {
@@ -285,9 +290,9 @@ export async function syncSemanticLinks(threshold = 0.65) {
       if (semanticRecords.length > 0) {
         await db.semanticLinks.bulkAdd(semanticRecords);
       }
+      console.log(`[NLP] Successfully stored ${semanticRecords.length} semantic link records in IndexedDB.`);
     });
 
-    console.log(`[NLP] Successfully computed and stored semantic links for ${linkedNotes.length} notes.`);
     return linkedNotes;
   } catch (err) {
     console.error('[NLP] Error syncing semantic links:', err);
@@ -392,6 +397,26 @@ export async function deleteNote(id) {
     await db.semanticLinks.where('targetNoteId').equals(id).delete();
   });
   scheduleSemanticSync(1500);
+}
+
+/**
+ * Completely resets and clears IndexedDB NoteGraphDB, then reloads the page
+ */
+export async function resetDatabase() {
+  console.log('[DB] Deleting NoteGraphDB...');
+  await db.delete();
+  console.log('[DB] Database deleted. Reloading...');
+  if (typeof window !== 'undefined') {
+    window.location.reload();
+  }
+}
+
+// Expose debug utilities to browser DevTools console
+if (typeof window !== 'undefined') {
+  window.db = db;
+  window.syncSemanticLinks = syncSemanticLinks;
+  window.resetDatabase = resetDatabase;
+  console.log('[NLP DB] Helpers attached to window: window.db, window.syncSemanticLinks(), window.resetDatabase()');
 }
 
 export default db;
