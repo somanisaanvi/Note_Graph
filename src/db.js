@@ -41,7 +41,7 @@ db.version(2).stores({
 });
 
 db.version(3).stores({
-  notes: '++id, title, createdAt, updatedAt',
+  notes: '++id, title, createdAt, updatedAt, fileName',
   links: '++id, sourceNoteId, targetTitle, targetNoteId, [sourceNoteId+targetTitle]',
   semanticLinks: '++id, sourceNoteId, targetNoteId, score, [sourceNoteId+targetNoteId]'
 });
@@ -142,6 +142,18 @@ export async function syncNoteLinks(sourceNoteId, content) {
       await db.links.bulkAdd(uniqueLinks);
     }
   });
+}
+
+/**
+ * Re-scan and synchronize wiki links for every note currently in the database
+ */
+export async function syncAllNoteLinks() {
+  const allNotes = await db.notes.toArray();
+  for (const note of allNotes) {
+    if (note.content) {
+      await syncNoteLinks(note.id, note.content);
+    }
+  }
 }
 
 // ------------------- NLP SEMANTIC EMBEDDINGS & SIMILARITY -------------------
@@ -372,7 +384,10 @@ export async function replaceNotesFromFolder(folderNotes) {
         await syncNoteLinks(note.id, note.content);
       }
     }
-  }
+    scheduleSemanticSync(1500);
+
+    return storedNotes;
+  });
 }
 
 // Database helper functions
@@ -381,6 +396,7 @@ export async function createNote(title = 'Untitled Note', content = '', extra = 
   const id = await db.notes.add({
     title,
     content,
+    fileName: extra.fileName || `${title}.md`,
     createdAt: now,
     updatedAt: now,
     ...extra
