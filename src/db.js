@@ -12,6 +12,11 @@ db.version(2).stores({
   links: '++id, sourceNoteId, targetTitle, targetNoteId, [sourceNoteId+targetTitle]'
 });
 
+db.version(3).stores({
+  notes: '++id, title, createdAt, updatedAt, fileName',
+  links: '++id, sourceNoteId, targetTitle, targetNoteId, [sourceNoteId+targetTitle]'
+});
+
 // Regular Expression to scan text and detect double-bracket links like [[Project Ideas]]
 export const WIKI_LINK_REGEX = /\[\[([^[\]]+)\]\]/g;
 
@@ -32,24 +37,28 @@ export function extractWikiLinks(text) {
 const initialNotes = [
   {
     title: 'Project Ideas',
+    fileName: 'Project Ideas.md',
     content: '# Project Ideas\n\nBuilding a [[PWA Knowledge Base]] with real-time IndexedDB persistence and graph visualization.\n\n- Offline-first storage with Dexie.js\n- Dynamic bidirectional backlinks\n- Force-directed graph simulation',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   },
   {
     title: 'PWA Knowledge Base',
+    fileName: 'PWA Knowledge Base.md',
     content: '# PWA Knowledge Base\n\nUses [[IndexedDB]] via Dexie.js and [[D3.js]] for interactive knowledge graph exploration.\n\n### Key Features\n1. Lightning fast local storage\n2. Real-time live query hooks\n3. Automatic relationship tracking',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   },
   {
     title: 'IndexedDB',
+    fileName: 'IndexedDB.md',
     content: '# IndexedDB\n\nClient-side storage system managed seamlessly with **Dexie.js** for lightning-fast offline queries.\n\n> "IndexedDB enables powerful web apps to work offline with full persistence."',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   },
   {
     title: 'D3.js',
+    fileName: 'D3.js.md',
     content: '# D3.js\n\nInteractive force-directed graph layout engine used to map node relationships dynamically.\n\nReferenced by [[PWA Knowledge Base]].',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -106,6 +115,18 @@ export async function syncNoteLinks(sourceNoteId, content) {
   });
 }
 
+/**
+ * Re-scan and synchronize wiki links for every note currently in the database
+ */
+export async function syncAllNoteLinks() {
+  const allNotes = await db.notes.toArray();
+  for (const note of allNotes) {
+    if (note.content) {
+      await syncNoteLinks(note.id, note.content);
+    }
+  }
+}
+
 // Initial populate listener
 db.on('populate', async () => {
   await db.notes.bulkAdd(initialNotes);
@@ -121,23 +142,56 @@ export async function ensureInitialNotes() {
   // Ensure links table is populated for all existing notes
   const linksCount = await db.links.count();
   if (linksCount === 0) {
-    const allNotes = await db.notes.toArray();
-    for (const note of allNotes) {
+    await syncAllNoteLinks();
+  }
+}
+
+/**
+ * Replace all notes in the database with notes loaded from a local directory
+ * @param {Array<{ title: string, content: string, fileName: string }>} folderNotes
+ * @returns {Promise<Array>} Newly stored notes
+ */
+export async function replaceNotesFromFolder(folderNotes) {
+  return await db.transaction('rw', db.notes, db.links, async () => {
+    await db.notes.clear();
+    await db.links.clear();
+
+    if (!folderNotes || folderNotes.length === 0) {
+      return [];
+    }
+
+    const records = folderNotes.map((n) => ({
+      title: n.title,
+      fileName: n.fileName,
+      content: n.content,
+      createdAt: n.createdAt || new Date().toISOString(),
+      updatedAt: n.updatedAt || new Date().toISOString()
+    }));
+
+    await db.notes.bulkAdd(records);
+    const storedNotes = await db.notes.toArray();
+
+    // Re-link notes
+    for (const note of storedNotes) {
       if (note.content) {
         await syncNoteLinks(note.id, note.content);
       }
     }
-  }
+
+    return storedNotes;
+  });
 }
 
 // Database helper functions
-export async function createNote(title = 'Untitled Note', content = '') {
+export async function createNote(title = 'Untitled Note', content = '', extra = {}) {
   const now = new Date().toISOString();
   const id = await db.notes.add({
     title,
     content,
+    fileName: extra.fileName || `${title}.md`,
     createdAt: now,
-    updatedAt: now
+    updatedAt: now,
+    ...extra
   });
   if (content) {
     await syncNoteLinks(id, content);
